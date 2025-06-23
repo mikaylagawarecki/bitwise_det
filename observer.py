@@ -1,8 +1,5 @@
 import logging
 
-import os
-import pickle
-import sys
 import traceback
 from collections import defaultdict
 from contextlib import contextmanager
@@ -25,7 +22,7 @@ _observer = None
 
 if not hasattr(torch, "xor_sum"):
     raise RuntimeError(
-        "torch.xor_sum is not available, please patch https://github.com/pytorch/pytorch/pull/154149/"
+        "torch.xor_sum is not available, for now please patch https://github.com/pytorch/pytorch/pull/154149/"
     )
 
 
@@ -66,18 +63,17 @@ class Run:
 
 class Observer:
     def __init__(
-        self, run: str, reference_hash_file: str = None, raise_on_mismatch: bool = False
+        self, run: str, reference_hash_file: Optional[str] = None, raise_on_mismatch: bool = False
     ):
         self.run = Run(run)
         self.raise_on_mismatch = raise_on_mismatch
         self.mismatches = {}
-        
-        # Create a HashMode instance
+
         self.hash_mode = HashMode()
         self.hash_mode.register_observer(self)
         # Store gradient observation hook handles for cleanup
         self.grad_hooks = []
-        # Dictionary to keep track of how many times each kind has been observed
+        # Gives id to dedup for when observe(kind) is called multiple times
         self.kind_counts = defaultdict(int)
         self.saved_tensors = {}
 
@@ -89,7 +85,7 @@ class Observer:
                 reference_hash_file
             )
             self.reference_hashes_idx = 0
-    
+
     def _read_reference_file(
         self, reference_hash_file: str
     ) -> tuple[list[Observation], Dict[str, Any]]:
@@ -109,18 +105,17 @@ class Observer:
             path = Path(reference_hash_file)
             if path.exists():
                 logger.info(f"Loading reference hashes from {reference_hash_file}")
-                with open(reference_hash_file, "rb") as f:
-                    reference_run = pickle.load(f)
-                    observations = reference_run.observations
+                reference_run = torch.load(path, map_location='cpu', mmap=True, weights_only=False)
+                observations = reference_run.observations
 
-                    # Load any saved tensors that have been marked as non-deterministic
-                    non_deterministic_tensors = reference_run.non_deterministic_tensors
-                    if non_deterministic_tensors:
-                        logger.info(
-                            f"Loaded {len(non_deterministic_tensors)} saved non-deterministic tensors"
-                        )
+                # Load any saved tensors that have been marked as non-deterministic
+                non_deterministic_tensors = reference_run.non_deterministic_tensors
+                if non_deterministic_tensors:
+                    logger.info(
+                        f"Loaded {len(non_deterministic_tensors)} saved non-deterministic tensors"
+                    )
 
-                logger.info(f"Loaded {len(observations)} reference hashes")
+            logger.info(f"Loaded {len(observations)} reference hashes")
         except Exception as e:
             logger.warning(f"Failed to load reference hashes: {e}")
 
@@ -137,7 +132,6 @@ class Observer:
         if len(self.reference_hashes) == 0:
             return
 
-        print(f"{unique_kind=}, {self.reference_hashes_idx=}")
         previous_observation = self.reference_hashes[self.reference_hashes_idx]
         reference_hash = previous_observation.value
         reference_kind = previous_observation.name
@@ -188,10 +182,7 @@ class Observer:
             value (Any): The value to be observed and hashed.
         """
         with no_dispatch():
-            # Update the count for this kind
             self.kind_counts[kind] += 1
-
-            # Create a unique name with the count
             unique_kind = f"{kind}_{self.kind_counts[kind]}"
 
             hashed_value = tree_map_only(Tensor, lambda x: hash_fn(x), value)
@@ -250,7 +241,7 @@ class Observer:
             handle.remove()
         self.grad_hooks = []
 
-    def mark_non_deterministic(self, name: str, tensor: Any):
+    def observe_non_deterministic(self, name: str, tensor: Any):
         """
         Mark a tensor as non-deterministic. This tensor will be saved during the reference run
         and loaded during verification runs to ensure deterministic behavior.
@@ -258,23 +249,62 @@ class Observer:
         Args:
             name (str): A unique name for this tensor
             tensor (Any): The tensor to save (can be a single tensor or a PyTree of tensors)
+
+        Returns:
+            tensor: The original tensor or the saved tensor if this is a verification run
         """
-        # Update the count for this name
-        self.kind_counts[name] += 1
+        with no_dispatch():
+            self.kind_counts[name] += 1
+            unique_name = f"{name}_{self.kind_counts[name]}"
 
-        # Create a unique name with the count
-        unique_name = f"{name}_{self.kind_counts[name]}"
+            if self.is_verification_run:
+                tensor = self._get_saved_tensor(unique_name).to(tensor.device)
+            else:
+                logger.info(
+                    f"Marking tensor '{unique_name}' (original: '{name}') as non-deterministic"
+                )
+                # Store the actual tensor value, not its hash
+                self.run.non_deterministic_tensors[unique_name] = tensor
+            
+            return tensor
 
-        logger.info(
-            f"Marking tensor '{unique_name}' (original: '{name}') as non-deterministic"
-        )
-        # Store the actual tensor value, not its hash
-        self.run.non_deterministic_tensors[unique_name] = tensor
+    def observe_non_deterministic_grad(self, name: str, tensor: Tensor):
+        """
+        Mark a tensor's gradient as non-deterministic. This registers a hook on the tensor
+        that will save the gradient during the reference run and load it during verification runs.
 
-        # Return the unique name so it can be used for retrieval later
-        return unique_name
+        Args:
+            name (str): A unique name for this gradient
+            tensor (Tensor): The tensor whose gradient will be marked as non-deterministic
 
-    def _get_saved_tensor(self, name: str) -> Optional[Any]:
+        Returns:
+            str: The unique name that will be used for the gradient (with index)
+        """
+        if not tensor.requires_grad:
+            logger.warning(
+                f"Cannot mark gradient as non-deterministic for tensor that doesn't require grad: {name}"
+            )
+            return name
+
+        # Create a name for the gradient
+        grad_name = f"{name}_grad"
+
+        def hook(grad):
+            with no_dispatch():
+                logger.info(f"Marking gradient for '{name}' as non-deterministic")
+                # Use the existing mark_non_deterministic method to handle the gradient
+                grad = self.observe_non_deterministic(grad_name, grad)
+            return grad   
+
+        # Register the hook and store the handle for later removal
+        handle = tensor.register_hook(hook)
+        self.grad_hooks.append(handle)
+        logger.info(f"Registered non-deterministic gradient hook for '{name}'")
+
+        # Return the name that will be used for the gradient
+        return grad_name
+
+    def _get_saved_tensor(self, name: str) -> Any:
         """
         Retrieve a previously saved non-deterministic tensor.
 
@@ -288,9 +318,8 @@ class Observer:
         if name in self.saved_tensors:
             logger.info(f"Using saved tensor '{name}' from reference run")
             return self.saved_tensors[name]
-
-        logger.warning(f"No saved tensor found for '{name}'")
-        return None
+        else:
+            raise RuntimeError(f"Saved tensor '{name}' not found in reference run")
 
     def enable_mode(self):
         """
@@ -435,93 +464,76 @@ def ObserverContext(
 
         # Write the observer state to the file
         with open(filename, "wb") as f:
-            pickle.dump(_observer.run, f)
+            torch.save(_observer.run, f)
         logger.info(f"Observations written to {filename}")
 
         # Restore the previous observer
         _observer = previous_observer
 
 
-def observe(kind: str, value: Any):
+def observe(name: str, value: Any):
     """
-    Record a value to the global Observer. Does nothing if the global observer
-    is not set.
+    Record a hash of a tensor to the global Observer.
+
     NOTE: this performs a host-device sync, so it should not be used in
     performance-critical code.
-    """
-    if _observer is not None:
-        _observer.observe(kind, value)
-
-
-def observe_grad(kind: str, tensor: Tensor):
-    """
-    Register a hook on the tensor's gradient that will save the hash of the gradient.
 
     Args:
-        kind (str): A name/identifier for this observation
+        name (str): A name/identifier for this observation
+        tensor (Tensor): The tensor whose gradient will be observed
+    """
+    if _observer is not None:
+        _observer.observe(name, value)
+
+
+def observe_grad(name: str, tensor: Tensor):
+    """
+    Register a hook on the tensor's gradient that will save the hash of the
+    gradient to the global observer.
+
+    Args:
+        name (str): A name/identifier for this observation
         tensor (Tensor): The tensor whose gradient will be observed
 
     """
     if _observer is not None:
-        _observer.observe_grad(kind, tensor)
+        _observer.observe_grad(name, tensor)
 
 
-def mark_non_deterministic(name: str, tensor: Any):
+def observe_non_deterministic(name: str, tensor: Any):
     """
     Mark a tensor as non-deterministic. This tensor will be saved during the reference run
     and loaded during verification runs to ensure deterministic behavior.
 
-    Args:
-        name (str): A unique name for this tensor
-        tensor (Any): The tensor to save (can be a single tensor or a PyTree of tensors)
+        Args:
+            name (str): A unique name for this tensor
+            tensor (Any): The tensor to save (can be a single tensor or a PyTree of tensors)
 
-    Returns:
-        str: The unique name generated for this tensor (with index)
-    """
-    if _observer is not None:
-        return _observer.mark_non_deterministic(name, tensor)
-    return name  # Return the original name if no observer is active
-
-
-def observe_non_deterministic(name: str, fn, *args, **kwargs):
-    """
-    Observe a non-deterministic operation. During reference runs, this will execute the function,
-    mark its output as non-deterministic, and return the output. During verification runs, it will
-    check if a saved tensor exists with the given name, and if so, return that instead of executing
-    the function.
-
-    Args:
-        name (str): A unique name for this non-deterministic operation
-        fn: The function to execute (if not using a saved tensor)
-        *args: Arguments to pass to the function
-        **kwargs: Keyword arguments to pass to the function
-
-    Returns:
-        The result of the function, or the saved tensor if available
+        Returns:
+            tensor: The original tensor or the saved tensor if this is a verification run
     """
     if _observer is None:
-        # If no observer is active, just run the function
-        return fn(*args, **kwargs)
+        return tensor
 
-    with no_dispatch():
-        if _observer.is_verification_run:
-            # In verification mode, try to get the saved tensor
-            saved_tensor = _observer._get_saved_tensor(name)
-            if saved_tensor is not None:
-                # Use the saved tensor instead of running the function
-                return saved_tensor
-
-        # Either in reference mode or no saved tensor available
-        # Run the function and get its output
-        output = fn(*args, **kwargs)
-
-    # If in reference mode, mark this tensor as non-deterministic
-    if not _observer.is_verification_run:
-        # mark_non_deterministic now returns the unique name it generated
-        _observer.mark_non_deterministic(name, output)
-
+    output = _observer.observe_non_deterministic(name, tensor)
     return output
 
+def observe_non_deterministic_grad(name: str, tensor: Tensor):
+    """
+    Mark a tensor's gradient as non-deterministic. This registers a hook on the tensor
+    that will save the gradient during the reference run and load it during verification runs.
+
+    Args:
+        name (str): A unique name for this gradient
+        tensor (Tensor): The tensor whose gradient will be marked as non-deterministic
+
+    Returns:
+        str: The unique name that will be used for the gradient (with index)
+    """
+    if _observer is None:
+        return tensor
+
+    return _observer.observe_non_deterministic_grad(name, tensor)
 
 def enable_hash_mode():
     """

@@ -53,11 +53,9 @@ def deterministic_mode(enable_deterministic):
 
 class TestBitwiseEquivalenceMode(unittest.TestCase):
     def setUp(self):
-        # Common setup for both tests
         self.B, self.M, self.N, self.nH, self.K, self.Kv = 1, 128, 1024, 8, 64, 64
 
     def _create_attention_tensors(self):
-        # Create query, key, value tensors for attention
         query = torch.randn(
             self.B,
             self.M,
@@ -93,10 +91,8 @@ class TestBitwiseEquivalenceMode(unittest.TestCase):
     @deterministic_mode(True)
     def test_no_error_with_deterministic_algorithms(self):
         """Test that no error is raised when deterministic algorithms are set."""
-        # Create tensors
         query, key, value = self._create_attention_tensors()
 
-        # Run with BitwiseEquivalenceMode
         with BitwiseEquivalenceMode(raise_on_mismatch=True) as mode:
             with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
                 attn_output = torch.nn.functional.scaled_dot_product_attention(
@@ -104,7 +100,6 @@ class TestBitwiseEquivalenceMode(unittest.TestCase):
                 )
                 attn_output.sum().backward()
 
-        # If we get here without an exception, the test passes
         self.assertEqual(
             len(mode.get_mismatches()),
             0,
@@ -114,10 +109,8 @@ class TestBitwiseEquivalenceMode(unittest.TestCase):
     @deterministic_mode(False)
     def test_error_without_deterministic_algorithms(self):
         """Test that an error is raised when deterministic algorithms are not set."""
-        # Create tensors
         query, key, value = self._create_attention_tensors()
 
-        # Run with BitwiseEquivalenceMode and expect an exception
         with self.assertRaises(RuntimeError) as context:
             with BitwiseEquivalenceMode(raise_on_mismatch=True) as mode:
                 with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
@@ -126,7 +119,6 @@ class TestBitwiseEquivalenceMode(unittest.TestCase):
                     )
                     attn_output.sum().backward()
 
-        # Check that the error message contains the expected function name
         self.assertIn(
             "aten._scaled_dot_product_efficient_attention_backward",
             str(context.exception),

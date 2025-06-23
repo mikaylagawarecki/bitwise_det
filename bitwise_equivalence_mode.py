@@ -19,10 +19,17 @@ class BitwiseEquivalenceMode(TorchDispatchMode):
         """
         self.raise_on_mismatch = raise_on_mismatch
         self.mismatches = []
+        # Use set_detect_anomaly for forward stack trace in backward
+        self._previous_anomaly_mode = torch.is_anomaly_enabled()
         torch.autograd.set_detect_anomaly(True)
-
+        # Filter the warning that would usually be raised by set_detect_anomaly
         warnings.filterwarnings("ignore", message="Error detected in .*Backward.*")
 
+    def __exit__(self, exc_type, exc_value, traceback):
+        torch.autograd.set_detect_anomaly(self._previous_anomaly_mode)
+        warnings.resetwarnings()
+        super().__exit__(exc_type, exc_value, traceback)
+    
     def clone_inputs_preserve_stride(self, args, kwargs):
         """
         Make a copy of the inputs while preserving their strides.
@@ -53,7 +60,6 @@ class BitwiseEquivalenceMode(TorchDispatchMode):
             mask2 = torch.isnan(t2)
 
             # FIXME: avoid D2H here
-            # Replace NaNs with a placeholder value (e.g., 0)
             tensor1_masked = torch.where(mask1, torch.tensor(0.0), t1)
             tensor2_masked = torch.where(mask2, torch.tensor(0.0), t2)
 

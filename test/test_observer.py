@@ -1,34 +1,29 @@
 #!/usr/bin/env python3
-"""
-Observer Tests - Demonstrates using the Observer system for continuous integration
-with expecttest-style tests using assertExpectedInline.
-
-This script shows how to:
-1. Run a model and generate observations
-2. Use assertExpectedInline to verify the model's outputs
-3. Update expected outputs when needed (similar to expecttest)
-"""
 
 import os
-import pickle
 import random
 import sys
 import tempfile
-from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 # Import our observer functionality
 observer_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if observer_path not in sys.path:
     sys.path.insert(0, observer_path)
-from observer import observe, observe_grad, observe_non_deterministic, ObserverContext
+from observer import (
+    observe,
+    observe_grad,
+    observe_non_deterministic,
+    observe_non_deterministic_grad,
+    ObserverContext,
+)
 
 
-# Define a non-deterministic custom operator (similar to observer_demo.py)
 class NonDeterministicOp(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input):
@@ -43,7 +38,6 @@ class NonDeterministicOp(torch.autograd.Function):
         return grad_output + noise
 
 
-# Register the custom operator
 non_deterministic_op = NonDeterministicOp.apply
 
 
@@ -52,37 +46,74 @@ class SimpleModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.conv1 = nn.Conv2d(3, 16, kernel_size=3, padding=1)
-        self.dropout = nn.Dropout(0.2)  # Dropout is non-deterministic
+        self.dropout = nn.Dropout(0.2)
         self.fc = nn.Linear(
             16 * 32 * 32, 10
-        )  # 32x32 is the feature map size after conv
+        )
 
     def forward(self, x):
-        # First convolution + activation
-        # Observe one of the weights in the conv layer
         observe("conv1_weight", self.conv1.weight)
 
         x = self.conv1(x)
         x = F.relu(x)
         observe("conv1_output", x)
 
-        # Apply non-deterministic dropout
-        # We use observe_non_deterministic to handle this operation
-        x = observe_non_deterministic("dropout_output", self.dropout, x)
-        observe("after_dropout", x)
+        x = self.dropout(x)
+        observe_non_deterministic("after_dropout", x)
 
-        # Apply our custom non-deterministic op
-        x = observe_non_deterministic(
-            "custom_non_deterministic", non_deterministic_op, x
-        )
-        observe("after_custom_op", x)
+        x = non_deterministic_op(x)
+        observe_non_deterministic("after_custom_op", x)
 
-        # Flatten and apply linear layer
         x = x.view(x.size(0), -1)
         x = self.fc(x)
         observe("output", x)
 
         return x
+
+
+class SDPAModel(nn.Module):
+    '''
+    A simple model with an SDPA layer that uses the efficient attention backend
+    for non-deterministic backward.
+    '''
+    def __init__(self, embed_dim=512, num_heads=8, head_dim=64, dropout_p=0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.dropout_p = dropout_p
+
+        self.q_proj = nn.Linear(
+            embed_dim, num_heads * head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        self.k_proj = nn.Linear(
+            embed_dim, num_heads * head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        self.v_proj = nn.Linear(
+            embed_dim, num_heads * head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        self.out_proj = nn.Linear(
+            num_heads * head_dim, embed_dim, device="cuda", dtype=torch.bfloat16
+        )
+
+    def forward(self, x_q, x_k, x_v):
+        q = self.q_proj(x_q)
+        k = self.k_proj(x_k)
+        v = self.v_proj(x_v)
+
+        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.dropout_p, is_causal=False
+            )
+
+        observe_non_deterministic_grad("q", q)
+        observe_non_deterministic_grad("k", k)
+        observe_non_deterministic_grad("v", v)
+
+        attn_output = attn_output
+        output = self.out_proj(attn_output)
+
+        return output
 
 
 class ObserverTests(TestCase):
@@ -98,34 +129,29 @@ class ObserverTests(TestCase):
 
         self.model = SimpleModel()
         self.input_data = torch.randn(4, 3, 32, 32)
-        self.maxDiff = None  # Show full diffs in test output
+        self.maxDiff = None
 
     def _load_observations(self, file_path):
         """Load observations from a pickle file and format them as a string."""
-        with open(file_path, "rb") as f:
-            run = pickle.load(f)
-            result = ""
-            for o in run.observations:
-                result += f"{o.name} hash: {o.value}\n"
-            return result
+        run = torch.load(file_path, map_location="cpu", weights_only=False)
+        result = ""
+        for o in run.observations:
+            result += f"{o.name} hash: {o.value}\n"
+        return result
 
     def _run_model_and_get_observations(
         self, with_hash_mode=False, modified_input=None
     ):
         """Run the model and return the observations as a formatted string."""
-        # Create a temporary directory for this test
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Run the model with observer
             with ObserverContext(dump_dir=temp_dir, name="test_run") as observer:
                 if with_hash_mode:
                     observer.enable_mode()
 
-                # Use the provided input or the default
                 input_data = (
                     self.input_data if modified_input is None else modified_input
                 )
 
-                # Record the input
                 observe("input", input_data)
 
                 # Run the model
@@ -146,8 +172,6 @@ class ObserverTests(TestCase):
 input_1 hash: 2136171533
 conv1_weight_1 hash: 112767265
 conv1_output_1 hash: 2030591017
-after_dropout_1 hash: 90887988
-after_custom_op_1 hash: 71213347
 output_1 hash: -2115480567
 """,
         )
@@ -172,9 +196,7 @@ output_1 hash: -2115480567
 
     def test_without_observer(self):
         """Test the model without using the Observer system."""
-        # Run the model twice with the same input but without Observer
         output1 = self.model(self.input_data)
-
         output2 = self.model(self.input_data)
 
         # These should be different due to non-deterministic operations
@@ -186,10 +208,8 @@ output_1 hash: -2115480567
 
     def test_with_hash_mode(self):
         """Test using the HashMode through enable_mode and disable_mode."""
-        # Run the model with HashMode enabled
         observations = self._run_model_and_get_observations(with_hash_mode=True)
 
-        # Use assertExpectedInline to verify the expected observations
         self.assertExpectedInline(
             observations,
             """\
@@ -199,8 +219,13 @@ __torch_dispatch__convolution.default_1 hash: 186153873
 __torch_dispatch__relu.default_1 hash: 2030591017
 __torch_dispatch__detach.default_1 hash: 2030591017
 conv1_output_1 hash: 2030591017
-after_dropout_1 hash: 90887988
-after_custom_op_1 hash: 71213347
+__torch_dispatch__empty_like.default_1 hash: 0
+__torch_dispatch__bernoulli_.float_1 hash: 1065353216
+__torch_dispatch__div_.Scalar_1 hash: 1067450368
+__torch_dispatch__mul.Tensor_1 hash: 90887988
+__torch_dispatch__rand_like.default_1 hash: 200463935
+__torch_dispatch__mul.Tensor_2 hash: 98933601
+__torch_dispatch__add.Tensor_1 hash: 71213347
 __torch_dispatch__view.default_1 hash: 71213347
 __torch_dispatch__t.default_1 hash: -2006178998
 __torch_dispatch__addmm.default_1 hash: -2115480567
@@ -210,19 +235,14 @@ output_1 hash: -2115480567
 
     def test_observe_grad(self):
         """Test the observe_grad functionality."""
-        # Create a simple model and input
         torch.manual_seed(42)
         model = nn.Linear(10, 5)
         input_tensor = torch.randn(2, 10)
 
-        # Create a temporary directory for this test
         with tempfile.TemporaryDirectory() as temp_dir:
-            # First run: generate reference hashes
             with ObserverContext(dump_dir=temp_dir, name="grad_test") as observer:
-                # Register gradient observation on the weight parameter
                 observe_grad("linear_weight_grad", model.weight)
 
-                # Forward and backward pass
                 output = model(input_tensor)
                 loss = output.sum()
                 loss.backward()
@@ -232,7 +252,6 @@ output_1 hash: -2115480567
                 os.path.join(temp_dir, "grad_test.pkl")
             )
 
-            # Use assertExpectedInline to verify the expected observations
             self.assertExpectedInline(
                 observations,
                 """\
@@ -268,6 +287,86 @@ linear_weight_grad_grad_1 hash: -12740299
             )
 
 
+    def test_observe_non_deterministic_grad_sdpa(self):
+        """Test the observe_non_deterministic_grad functionality with SDPA."""
+        torch.use_deterministic_algorithms(False)
+        torch.manual_seed(42)
+        B, M, N, nH, K, Kv = 1, 128, 1024, 8, 64, 64
+        model = SDPAModel(embed_dim=Kv, num_heads=nH, head_dim=K, dropout_p=0.1)
+
+        query = torch.randn(
+            B, M, nH, K, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        ).transpose(1, 2)
+        key = torch.randn(
+            B, N, nH, K, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        ).transpose(1, 2)
+        value = torch.randn(
+            B, N, nH, Kv, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        ).transpose(1, 2)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # First run: generate reference data with non-deterministic gradients
+            reference_file = os.path.join(temp_dir, "sdpa_non_det_reference.pkl")
+
+            with ObserverContext(
+                dump_dir=temp_dir, name="sdpa_non_det_reference"
+            ) as observer:
+                observe_grad("q_proj_weight", model.q_proj.weight)
+
+                # Forward pass through the model
+                output = model(query, key, value)
+                loss = output.sum()
+                loss.backward()
+            
+            model.zero_grad()
+
+            # Second run: verification run using the reference data
+            with ObserverContext(
+                dump_dir=temp_dir,
+                name="sdpa_non_det_verification",
+                reference_hash_file=reference_file,
+            ) as observer:
+                observe_grad("q_proj_weight", model.q_proj.weight)
+
+                output = model(query, key, value)
+                loss = output.sum()
+                loss.backward()
+
+                self.assertEqual(
+                    len(observer.mismatches),
+                    0,
+                    f"Expected no mismatches but found: {observer.mismatches}",
+                )
+
+            model.zero_grad()
+            
+            # Third run: using a different seed to demonstrate that without the saved gradient,
+            # we would get different results
+            torch.manual_seed(43)
+
+            with ObserverContext(
+                dump_dir=temp_dir,
+                name="sdpa_non_det_different_seed",
+            ) as observer:
+
+                observe_grad("q_proj_weight", model.q_proj.weight)
+
+                # Forward pass through the model
+                output = model(query, key, value)
+                loss = output.sum()
+                loss.backward()
+
+            reference_observations = self._load_observations(reference_file)
+            different_seed_observations = self._load_observations(
+                os.path.join(temp_dir, "sdpa_non_det_different_seed.pkl")
+            )
+
+            self.assertNotEqual(
+                reference_observations,
+                different_seed_observations,
+                "Observations match with different seed (unexpected)",
+            )
+
+
 if __name__ == "__main__":
-    # Run the tests using PyTorch's test runner
     run_tests()
